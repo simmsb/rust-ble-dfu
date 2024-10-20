@@ -444,7 +444,7 @@ pub fn parse_response<R: Request>(buf: &[u8]) -> eyre::Result<Option<R::Response
     }
 
     if buf[1] != R::OPCODE as u8 {
-        tracing::warn!(
+        tracing::debug!(
             "skipping message (expected echoed opcode {:?} (0x{:02x}), got 0x{:02x})",
             R::OPCODE,
             R::OPCODE as u8,

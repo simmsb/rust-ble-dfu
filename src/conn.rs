@@ -8,7 +8,10 @@ use futures_lite::StreamExt;
 use tokio::sync::Semaphore;
 use tokio_util::time::FutureExt;
 
-use crate::messages::{self, *};
+use crate::{
+    messages::{self, *},
+    Prog, RefreshAlongsideExt,
+};
 
 const PROTOCOL_VERSION: u8 = 1;
 
@@ -159,7 +162,7 @@ impl BootloaderConnection {
     /// Sends the `.dat` file that's zipped into our firmware DFU .zip(?)
     /// modeled after `pc-nrfutil`s `dfu_transport_serial::send_init_packet()`
     pub async fn send_init_packet(&mut self, data: &[u8]) -> eyre::Result<()> {
-        tracing::info!("Sending init packet...");
+        tracing::debug!("Sending init packet...");
         let select_response = self.select_object_command().await?;
         tracing::debug!("Object selected: {:?}", select_response);
 
@@ -170,7 +173,7 @@ impl BootloaderConnection {
         tracing::debug!("Command created");
 
         tracing::debug!("Streaming Data: len: {}", data_size);
-        self.stream_object_data(data).await?;
+        self.stream_object_data(data, None).await?;
 
         tracing::debug!("Done, fetching CRC");
         let received_crc = self.get_crc_upto_offset(data_size).await?.crc;
@@ -183,11 +186,11 @@ impl BootloaderConnection {
 
     /// Sends the firmware image at `bin_path`.
     /// This is done in chunks to avoid exceeding our MTU  and involves periodic CRC checks.
-    pub async fn send_firmware(&mut self, image: &[u8]) -> eyre::Result<()> {
-        tracing::info!("Sending firmware image of size {}...", image.len());
+    pub async fn send_firmware(&mut self, image: &[u8], pb: &mut Prog) -> eyre::Result<()> {
+        tracing::debug!("Sending firmware image of size {}...", image.len());
 
         tracing::debug!("Selecting Object: type Data");
-        let select_response = self.select_object_data().await?;
+        let select_response = self.select_object_data().refresh_alongisde(pb).await?;
         tracing::debug!("Object selected: {:?}", select_response);
 
         let max_size = select_response.max_size;
@@ -195,19 +198,30 @@ impl BootloaderConnection {
         let mut offset: u32 = 0;
 
         for chunk in image.chunks(max_size.try_into().unwrap()) {
+            pb.set_status("Erasing flash region");
             let curr_chunk_sz: u32 = chunk.len().try_into().unwrap();
-            self.create_data_object(curr_chunk_sz).await?;
+            self.create_data_object(curr_chunk_sz)
+                .refresh_alongisde(pb)
+                .await?;
+
+            pb.set_status("Uploading firmware");
             tracing::debug!("Streaming Data: len: {}", curr_chunk_sz);
 
-            self.stream_object_data(chunk).await?;
+            self.stream_object_data(chunk, Some(pb)).await?;
 
             offset += chunk.len() as u32;
 
-            let received_crc = self.get_crc_upto_offset(offset).await?;
+            pb.set_status("Checking crc");
+
+            let received_crc = self
+                .get_crc_upto_offset(offset)
+                .refresh_alongisde(pb)
+                .await?;
             tracing::debug!("crc response: {:?}", received_crc);
             prev_chunk_crc = self.check_crc(chunk, received_crc.crc, prev_chunk_crc)?;
 
-            self.execute().await?;
+            pb.set_status("Executing update");
+            self.execute().refresh_alongisde(pb).await?;
         }
 
         tracing::info!("Done.");
@@ -310,7 +324,11 @@ impl BootloaderConnection {
         Ok(self.request_response(GetMtuRequest).await?.0)
     }
 
-    pub async fn stream_object_data(&mut self, data: &[u8]) -> eyre::Result<()> {
+    pub async fn stream_object_data(
+        &mut self,
+        data: &[u8],
+        mut pb: Option<&mut Prog>,
+    ) -> eyre::Result<()> {
         let max_chunk_size = usize::from(self.mtu);
 
         for chunk in data.chunks(max_chunk_size) {
@@ -321,7 +339,14 @@ impl BootloaderConnection {
                 .await?
                 .context("Timed out aquiring semaphore to send chunk, maybe just allow anyway?")?;
 
-            self.packet.write_without_response(chunk).await?;
+            self.packet
+                .write_without_response(chunk)
+                .refresh_alongside_opt(pb.as_deref_mut())
+                .await?;
+
+            if let Some(pb) = pb.as_deref_mut() {
+                pb.increment(chunk.len());
+            }
 
             // important: the semaphore is refilled by the device sending us an
             // update

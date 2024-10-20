@@ -6,7 +6,10 @@ mod conn;
 mod messages;
 
 use std::error::Error;
+use std::future::Future;
+use std::io::{stderr, IsTerminal};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use bluest::btuuid::characteristics::{FIRMWARE_REVISION_STRING, MODEL_NUMBER_STRING};
 use bluest::btuuid::services::DEVICE_INFORMATION;
@@ -16,8 +19,10 @@ use color_eyre::eyre::OptionExt;
 use conn::BootloaderConnection;
 use elf::read_elf_image;
 use futures_lite::StreamExt;
-use tracing::info;
+use kdam::{tqdm, BarExt as _, Column, RichProgress, Spinner};
+use ondrop::OnDrop;
 use tracing::metadata::LevelFilter;
+use tracing::{debug, info};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -73,6 +78,13 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
 
     let cmd = Cli::parse();
 
+    kdam::term::init(stderr().is_terminal());
+    kdam::term::hide_cursor()?;
+
+    let _show_again = OnDrop::new(|| {
+        _ = kdam::term::show_cursor();
+    });
+
     let adapter = Adapter::default()
         .await
         .ok_or("Bluetooth adapter not found")?;
@@ -91,16 +103,127 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+struct Prog {
+    inner: RichProgress,
+}
+
+impl Prog {
+    fn new() -> Self {
+        Self {
+            inner: RichProgress::new(
+                tqdm!(),
+                vec![
+                    Column::Spinner(Spinner::new(
+                        &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+                        80.0,
+                        1.0,
+                    )),
+                    Column::Text("[bold blue]".to_owned()),
+                    Column::Animation,
+                    Column::ElapsedTime,
+                ],
+            ),
+        }
+    }
+
+    pub fn bar(&mut self) -> &mut RichProgress {
+        &mut self.inner
+    }
+
+    pub fn set_status(&mut self, status: &str) {
+        self.inner
+            .replace(1, Column::Text(format!("[bold blue]{status}")));
+        _ = self.inner.refresh();
+    }
+
+    pub fn become_tracked(&mut self, total: usize) {
+        let msg = self.inner.columns.remove(1);
+        self.inner.pb = tqdm!(
+            total = total,
+            unit_scale = true,
+            unit_divisor = 1024,
+            unit = "B"
+        );
+        self.inner.columns = vec![
+            Column::Spinner(Spinner::new(
+                &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+                80.0,
+                1.0,
+            )),
+            msg,
+            Column::Animation,
+            Column::Percentage(1),
+            Column::Text("•".to_owned()),
+            Column::CountTotal,
+            Column::Text("•".to_owned()),
+            Column::Rate,
+            Column::Text("•".to_owned()),
+            Column::ElapsedTime,
+        ];
+        _ = self.inner.refresh();
+    }
+
+    pub fn increment(&mut self, n: usize) {
+        _ = self.inner.update(n);
+    }
+
+    #[allow(unused)]
+    pub fn set(&mut self, n: usize) {
+        _ = self.inner.update_to(n);
+    }
+
+    pub fn refresh(&mut self) {
+        _ = self.inner.refresh();
+    }
+}
+
+pub(crate) trait RefreshAlongsideExt: Future + Sized {
+    async fn refresh_alongisde(self, pb: &mut Prog) -> Self::Output {
+        let interval = pb.bar().pb.mininterval;
+
+        let update_fut = async {
+            let mut int = tokio::time::interval(Duration::from_secs_f32(interval));
+            loop {
+                pb.refresh();
+
+                int.tick().await;
+            }
+        };
+
+        tokio::select! {
+            v = update_fut => {
+                v // actually ! (never), but the maro brokd
+            }
+            v = self => {
+                return v;
+            }
+        }
+    }
+
+    async fn refresh_alongside_opt(self, pb: Option<&mut Prog>) -> Self::Output {
+        if let Some(pb) = pb {
+            self.refresh_alongisde(pb).await
+        } else {
+            self.await
+        }
+    }
+}
+
+impl<F: Future> RefreshAlongsideExt for F {}
+
 async fn do_update(
     adapter: &Adapter,
     device_name: &str,
     file: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    info!("starting scan");
+    let mut pb = Prog::new();
+
+    pb.set_status("Scanning");
+    debug!("starting scan");
     let mut scan = adapter.scan(&[]).await?;
-    info!("scan started");
+    debug!("scan started");
     let device = loop {
-        let Some(discovered_device) = scan.next().await else {
+        let Some(discovered_device) = scan.next().refresh_alongisde(&mut pb).await else {
             return Ok(());
         };
         if discovered_device.adv_data.local_name.as_deref() == Some(device_name) {
@@ -108,15 +231,25 @@ async fn do_update(
         }
     };
 
-    adapter.connect_device(&device).await?;
-    let services = device.discover_services().await?;
+    pb.set_status("Connecting");
+    adapter
+        .connect_device(&device)
+        .refresh_alongisde(&mut pb)
+        .await?;
+
+    pb.set_status("Getting services");
+
+    let services = device.services().refresh_alongisde(&mut pb).await?;
 
     let service = services
         .iter()
         .find(|s| s.uuid() == Uuid::from_u16(0xFE59))
         .ok_or_eyre("Couldn't find the DFU service")?;
 
-    let characteristics = service.discover_characteristics().await?;
+    let characteristics = service
+        .discover_characteristics()
+        .refresh_alongisde(&mut pb)
+        .await?;
 
     // println!("{characteristics:#?}");
 
@@ -129,29 +262,55 @@ async fn do_update(
         .find(|c| c.uuid() == Uuid::from_u128(0x8EC90002_F315_4F60_9FB8_838830DAEA50))
         .ok_or_eyre("Missing firmware revision service")?;
 
-    let mut conn = BootloaderConnection::new(packet_c.clone(), control_c.clone()).await?;
+    pb.set_status("Initiating DFU connection");
+
+    let mut conn = BootloaderConnection::new(packet_c.clone(), control_c.clone())
+        .refresh_alongisde(&mut pb)
+        .await?;
 
     let elf = std::fs::read(file)?;
     let mut image = read_elf_image(&elf)?;
 
-    conn.set_receipt_notification(8).await?;
+    conn.set_receipt_notification(8)
+        .refresh_alongisde(&mut pb)
+        .await?;
 
-    let obj_select = conn.select_object_command().await;
+    let obj_select = conn
+        .select_object_command()
+        .refresh_alongisde(&mut pb)
+        .await;
     tracing::debug!("select object response: {:?}", obj_select);
 
-    let version = conn.fetch_protocol_version().await?;
+    let version = conn
+        .fetch_protocol_version()
+        .refresh_alongisde(&mut pb)
+        .await?;
     tracing::debug!("protocol version: {}", version);
 
-    let hw_version = conn.fetch_hardware_version().await?;
+    let hw_version = conn
+        .fetch_hardware_version()
+        .refresh_alongisde(&mut pb)
+        .await?;
     tracing::debug!("hardware version: {:?}", hw_version);
 
     while image.len() % 4 != 0 {
         image.push(0xff);
     }
 
+    pb.set_status("Initiating DFU update");
+
     let init_packet = init_packet::build_init_packet(&image);
-    conn.send_init_packet(&init_packet).await?;
-    conn.send_firmware(&image).await?;
+    conn.send_init_packet(&init_packet)
+        .refresh_alongisde(&mut pb)
+        .await?;
+
+    pb.become_tracked(image.len());
+
+    pb.set_status("Uploading firmware");
+
+    conn.send_firmware(&image, &mut pb).await?;
+
+    pb.set_status("Done, device rebooting");
 
     Ok(())
 }
