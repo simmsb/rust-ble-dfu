@@ -1,5 +1,5 @@
 [package]
-name = "rusty-ble-test"
+name = "ble-dfu"
 version = "0.1.0"
 edition = "2021"
 
