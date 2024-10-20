@@ -78,13 +78,6 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
 
     let cmd = Cli::parse();
 
-    kdam::term::init(stderr().is_terminal());
-    kdam::term::hide_cursor()?;
-
-    let _show_again = OnDrop::new(|| {
-        _ = kdam::term::show_cursor();
-    });
-
     let adapter = Adapter::default()
         .await
         .ok_or("Bluetooth adapter not found")?;
@@ -96,6 +89,13 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
             get_info(&adapter, Side::Right.bt_name()).await?;
         }
         Cli::Update(UpdateCmd { side, file }) => {
+            kdam::term::init(stderr().is_terminal());
+            kdam::term::hide_cursor()?;
+
+            let _show_again = OnDrop::new(|| {
+                _ = kdam::term::show_cursor();
+            });
+
             do_update(&adapter, side.bt_name(), &file).await?;
         }
     }
