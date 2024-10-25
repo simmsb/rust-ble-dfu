@@ -71,8 +71,7 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
         .with(
             EnvFilter::builder()
                 .with_default_directive(LevelFilter::WARN.into())
-                .from_env_lossy()
-                .add_directive("rusty_ble_test=INFO".parse().unwrap()),
+                .from_env_lossy(),
         )
         .init();
 
@@ -93,10 +92,18 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
             kdam::term::hide_cursor()?;
 
             let _show_again = OnDrop::new(|| {
-                _ = kdam::term::show_cursor();
+                kdam::term::show_cursor().unwrap();
             });
 
-            do_update(&adapter, side.bt_name(), &file).await?;
+            tokio::select!(
+                _ = tokio::signal::ctrl_c() => {
+                    kdam::term::show_cursor().unwrap();
+                }
+                r = do_update(&adapter, side.bt_name(), &file) => {
+                    r?;
+                }
+
+            );
         }
     }
 

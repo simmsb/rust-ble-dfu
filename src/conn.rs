@@ -106,7 +106,7 @@ impl BootloaderConnection {
     }
 
     /// send `req` and do not fetch any response
-    async fn request<R: Request>(&mut self, req: R) -> eyre::Result<()> {
+    async fn request<R: Request>(&mut self, req: &R) -> eyre::Result<()> {
         let mut buf = vec![R::OPCODE as u8];
         req.write_payload(&mut buf)?;
         tracing::trace!("--> {:?}", buf);
@@ -120,19 +120,50 @@ impl BootloaderConnection {
 
     /// send `req` and expect a response.
     /// aborts if no response is received within timeout window.
-    async fn request_response<R: Request>(&mut self, req: R) -> eyre::Result<R::Response> {
+    async fn request_response<R: Request>(
+        &mut self,
+        req: &R,
+        timeout: Duration,
+    ) -> eyre::Result<R::Response> {
         self.request(req).await?;
 
-        self.response::<R>().await
+        self.response::<R>(timeout).await
     }
 
-    pub async fn response<R: Request>(&mut self) -> eyre::Result<R::Response> {
+    async fn retrying_request_response<R: Request>(
+        &mut self,
+        req: &R,
+    ) -> eyre::Result<R::Response> {
+        self.retrying_request_response_t(req, None).await
+    }
+
+    async fn retrying_request_response_t<R: Request>(
+        &mut self,
+        req: &R,
+        timeout: Option<Duration>,
+    ) -> eyre::Result<R::Response> {
+        let timeout = timeout.unwrap_or(Duration::from_secs(2));
+
+        for _ in 0..5 {
+            self.request(req).await?;
+
+            if let Ok(x) = self.response::<R>(timeout).await {
+                return Ok(x);
+            }
+        }
+
+        self.request(req).await?;
+
+        self.response::<R>(timeout).await
+    }
+
+    pub async fn response<R: Request>(&mut self, timeout: Duration) -> eyre::Result<R::Response> {
         loop {
             let r = self
                 .response_chan
                 .recv()
                 // wiping memory can take a while it seems
-                .timeout(Duration::from_secs(30))
+                .timeout(timeout)
                 .await;
 
             let Ok(Some(r)) = r else {
@@ -148,7 +179,9 @@ impl BootloaderConnection {
     }
 
     pub async fn fetch_protocol_version(&mut self) -> eyre::Result<u8> {
-        let response = self.request_response(ProtocolVersionRequest).await;
+        let response = self
+            .retrying_request_response(&ProtocolVersionRequest)
+            .await;
         match response {
             Ok(version_response) => Ok(version_response.version),
             Err(e) => Err(e),
@@ -156,7 +189,8 @@ impl BootloaderConnection {
     }
 
     pub async fn fetch_hardware_version(&mut self) -> eyre::Result<HardwareVersionResponse> {
-        self.request_response(HardwareVersionRequest).await
+        self.retrying_request_response(&HardwareVersionRequest)
+            .await
     }
 
     /// Sends the `.dat` file that's zipped into our firmware DFU .zip(?)
@@ -229,9 +263,9 @@ impl BootloaderConnection {
     }
 
     async fn get_crc_upto_offset(&mut self, expected: u32) -> eyre::Result<CrcResponse> {
-        self.request(CrcRequest).await?;
+        self.request(&CrcRequest).await?;
         loop {
-            let crc = match self.response::<CrcRequest>().await {
+            let crc = match self.response::<CrcRequest>(Duration::from_secs(2)).await {
                 Ok(crc) => crc,
                 Err(err) => {
                     tracing::debug!(
@@ -275,7 +309,7 @@ impl BootloaderConnection {
     /// Request Type: `Select`
     /// Parameters:   `Object type = Command`
     pub async fn select_object_command(&mut self) -> eyre::Result<SelectResponse> {
-        self.request_response(SelectRequest(ObjectType::Command))
+        self.retrying_request_response(&SelectRequest(ObjectType::Command))
             .await
     }
 
@@ -283,7 +317,8 @@ impl BootloaderConnection {
     /// Request Type: `Select`
     /// Parameters:   `Object type = Data`
     pub async fn select_object_data(&mut self) -> eyre::Result<SelectResponse> {
-        self.request_response(SelectRequest(ObjectType::Data)).await
+        self.retrying_request_response(&SelectRequest(ObjectType::Data))
+            .await
     }
 
     /// Sends a
@@ -291,10 +326,13 @@ impl BootloaderConnection {
     /// Parameters:   `Object type = Command`
     ///               `size`
     pub async fn create_command_object(&mut self, size: u32) -> eyre::Result<()> {
-        self.request_response(CreateObjectRequest {
-            obj_type: ObjectType::Command,
-            size,
-        })
+        self.retrying_request_response_t(
+            &CreateObjectRequest {
+                obj_type: ObjectType::Command,
+                size,
+            },
+            Some(Duration::from_secs(30)),
+        )
         .await?;
         Ok(())
     }
@@ -306,22 +344,25 @@ impl BootloaderConnection {
     pub async fn create_data_object(&mut self, size: u32) -> eyre::Result<()> {
         // Note: Data objects cannot be created if no init packet has been sent. This results in an
         // `OperationNotPermitted` error.
-        self.request_response(CreateObjectRequest {
-            obj_type: ObjectType::Data,
-            size,
-        })
+        self.retrying_request_response_t(
+            &CreateObjectRequest {
+                obj_type: ObjectType::Data,
+                size,
+            },
+            Some(Duration::from_secs(30)),
+        )
         .await?;
         Ok(())
     }
 
     pub async fn set_receipt_notification(&mut self, every_n_packets: u16) -> eyre::Result<()> {
-        self.request_response(SetPrnRequest(every_n_packets))
+        self.retrying_request_response(&SetPrnRequest(every_n_packets))
             .await?;
         Ok(())
     }
 
     pub async fn fetch_mtu(&mut self) -> eyre::Result<u16> {
-        Ok(self.request_response(GetMtuRequest).await?.0)
+        Ok(self.retrying_request_response(&GetMtuRequest).await?.0)
     }
 
     pub async fn stream_object_data(
@@ -365,11 +406,13 @@ impl BootloaderConnection {
     }
 
     pub async fn get_crc(&mut self) -> eyre::Result<CrcResponse> {
-        self.request_response(CrcRequest).await
+        self.retrying_request_response_t(&CrcRequest, Some(Duration::from_secs(10)))
+            .await
     }
 
     // tell the target to execute whatever request setup we sent them before
     pub async fn execute(&mut self) -> eyre::Result<ExecuteResponse> {
-        self.request_response(ExecuteRequest).await
+        self.retrying_request_response_t(&ExecuteRequest, Some(Duration::from_secs(20)))
+            .await
     }
 }

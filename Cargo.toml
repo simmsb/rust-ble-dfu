@@ -9,6 +9,7 @@ byteorder = "1.5.0"
 clap = { version = "4.5.20", features = ["derive"] }
 color-eyre = "0.6.3"
 crc32fast = "1.4.2"
+ctrlc = "3.4.5"
 eyre = "0.6.12"
 futures-lite = "2.3.0"
 kdam = { version = "0.5.2", features = ["derive", "rich", "spinner", "template"] }
