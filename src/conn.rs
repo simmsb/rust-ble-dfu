@@ -263,27 +263,40 @@ impl BootloaderConnection {
     }
 
     async fn get_crc_upto_offset(&mut self, expected: u32) -> eyre::Result<CrcResponse> {
-        self.request(&CrcRequest).await?;
-        loop {
-            let crc = match self.response::<CrcRequest>(Duration::from_secs(2)).await {
-                Ok(crc) => crc,
-                Err(err) => {
-                    tracing::debug!(
-                        "Bad decode while waiting for a CRC, probably just a bodyless CRC: {}",
-                        err
-                    );
-                    continue;
+        for _ in 0..4 {
+            let inner = async {
+                self.request(&CrcRequest).await?;
+                loop {
+                    let crc = match self.response::<CrcRequest>(Duration::from_secs(2)).await {
+                        Ok(crc) => crc,
+                        Err(err) => {
+                            tracing::debug!(
+                            "Bad decode while waiting for a CRC, probably just a bodyless CRC: {}",
+                            err
+                        );
+                            continue;
+                        }
+                    };
+
+                    if crc.offset == expected {
+                        return Ok(crc);
+                    } else if crc.offset < expected {
+                        tracing::trace!("Received a CRC for a prior offset (expecting: {expected}, got: {}) (probably from receipts), discarding", crc.offset);
+                    } else {
+                        eyre::bail!(
+                            "Got CRC with offset in the future, not sure what happened here"
+                        );
+                    }
                 }
             };
 
-            if crc.offset == expected {
-                return Ok(crc);
-            } else if crc.offset < expected {
-                tracing::trace!("Received a CRC for a prior offset (expecting: {expected}, got: {}) (probably from receipts), discarding", crc.offset);
-            } else {
-                eyre::bail!("Got CRC with offset in the future, not sure what happened here");
+            match inner.timeout(Duration::from_secs(4)).await {
+                Ok(v) => return v,
+                Err(_err) => continue,
             }
         }
+
+        eyre::bail!("Timed out trying to get CRC response, probably because we failed to write everything :(");
     }
 
     fn check_crc(&self, data: &[u8], received_crc: u32, initial: u32) -> eyre::Result<u32> {

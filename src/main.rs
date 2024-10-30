@@ -356,5 +356,25 @@ async fn get_info(adapter: &Adapter, device_name: &str) -> Result<(), Box<dyn Er
     let firmware_revision = String::from_utf8(firmware_revision_c.read().await?)?;
     println!("({device_name}) device info: {model_number}: {firmware_revision}");
 
+
+    let uptime_service = services
+        .iter()
+        .find(|s| s.uuid() == Uuid::from_u128(0xc5cef932_96f3_11ef_a546_4374a33721fe))
+        .ok_or_eyre("Couldn't find the uptime service")?;
+
+    let uptime_characteristics =
+        uptime_service.discover_characteristics().await?;
+
+    let uptime_c = uptime_characteristics
+        .iter()
+        .find(|c| c.uuid() == Uuid::from_u128(0xcaafd50c_96f3_11ef_bf9a_6fd22bab853a))
+        .ok_or_eyre("Missing uptime characteristic")?;
+
+    let uptime = uptime_c.read().await?;
+    let uptime = u64::from_le_bytes(uptime.try_into().map_err(|e| eyre::eyre!("Wanted uptime as a u64 but got: {:?}", e))?);
+
+    println!("({device_name}) uptime: {uptime}s");
+
+
     Ok(())
 }
