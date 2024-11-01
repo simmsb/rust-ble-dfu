@@ -372,6 +372,8 @@ async fn get_info(adapter: &Adapter, device_name: &str) -> Result<(), Box<dyn Er
 
     let uptime = uptime_c.read().await?;
     let uptime = u64::from_le_bytes(uptime.try_into().map_err(|e| eyre::eyre!("Wanted uptime as a u64 but got: {:?}", e))?);
+    let uptime = core::time::Duration::from_secs(uptime);
+    let uptime = humantime::format_duration(uptime);
 
     println!("({device_name}) uptime: {uptime}s");
 
