@@ -52,10 +52,10 @@ impl BootloaderConnection {
                         }
                     };
 
-                    if messages::response_is_type::<CrcRequest>(&msg) {
+                    if messages::parse_response::<CrcRequest>(&msg).is_ok() {
                         // for each crc response, reset the tokens on the semaphore
 
-                        sem.add_permits(1usize.saturating_sub(sem.available_permits()));
+                        sem.add_permits(4.min(8usize.saturating_sub(sem.available_permits())));
                     }
 
                     // let Some(Ok(next)) = response_stream.next().await else {
@@ -386,12 +386,16 @@ impl BootloaderConnection {
         let max_chunk_size = usize::from(self.mtu);
 
         for chunk in data.chunks(max_chunk_size) {
-            let token = self
+            let token = match self
                 .chunk_sem
                 .acquire()
-                .timeout(Duration::from_secs(10))
-                .await?
-                .context("Timed out aquiring semaphore to send chunk, maybe just allow anyway?")?;
+                .timeout(Duration::from_millis(500))
+                .refresh_alongside_opt(pb.as_deref_mut())
+                .await
+            {
+                Ok(x) => Some(x?),
+                Err(e) => None,
+            };
 
             self.packet
                 .write_without_response(chunk)
@@ -404,7 +408,9 @@ impl BootloaderConnection {
 
             // important: the semaphore is refilled by the device sending us an
             // update
-            token.forget();
+            if let Some(token) = token {
+                token.forget();
+            }
 
             // let r = self
             //     .response_chan
